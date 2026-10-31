@@ -1,4 +1,4 @@
-name: Release image
+name: Release
 
 on:
   pull_request:
@@ -93,17 +93,33 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish AMD64 and ARM64 images
+      - name: Publish images and export AMD64 and ARM64 binaries
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          outputs: type=local,dest=binaries
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Package release binaries
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          mkdir -p release
+          for arch in amd64 arm64; do
+            binary="binaries/linux_$arch/memoc"
+            test -x "$binary"
+            test "$("$binary" --version)" = "memoc $RELEASE_VERSION"
+            tar -czf "release/memoc-linux-$arch.tar.gz" -C "binaries/linux_$arch" memoc
+          done
+          cd release
+          sha256sum memoc-*.tar.gz > SHA256SUMS
 
       - name: Publish GitHub release
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
@@ -112,5 +128,7 @@ jobs:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           if ! gh release view "$RELEASE_TAG" --json tagName > /dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --verify-tag --generate-notes --title "$RELEASE_TAG"
+            gh release create "$RELEASE_TAG" --verify-tag --generate-notes --title "$RELEASE_TAG" --draft
           fi
+          gh release upload "$RELEASE_TAG" release/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false
