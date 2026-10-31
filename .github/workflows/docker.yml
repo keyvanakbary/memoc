@@ -1,0 +1,116 @@
+name: Release image
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize releases. A queued run checks out the latest main and includes all
+# commits since the previous release; a release already in progress is not cancelled.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref == 'refs/heads/main' && 'main' || github.ref }}
+          fetch-depth: 0
+          persist-credentials: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+
+      - name: Test release rules
+        run: python3 -m unittest discover -s scripts -p 'test_release.py'
+
+      # Highest bump wins: breaking change = major, feat = minor, anything else = patch.
+      - name: Prepare release version
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        id: release
+        run: python3 scripts/release.py
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build image for testing
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: memoc:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test mounted content, HTTP serving, and rebuilds
+        run: python3 scripts/test_docker.py --image memoc:test
+
+      - name: Commit and tag the tested version
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        id: commit
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          VERSION_CHANGED: ${{ steps.release.outputs.changed }}
+        run: |
+          if [ "$VERSION_CHANGED" = true ]; then
+            git add Cargo.toml Cargo.lock
+            git -c user.name='github-actions[bot]' \
+                -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                commit -m "chore(release): $RELEASE_TAG [skip ci]"
+            git tag "$RELEASE_TAG"
+            git push --atomic origin HEAD:refs/heads/main "refs/tags/$RELEASE_TAG"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Image tags and labels
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: latest=true
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.release.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.release.outputs.version }}
+            type=semver,pattern={{major}},value=${{ steps.release.outputs.version }},enable=${{ !startsWith(steps.release.outputs.version, '0.') }}
+            type=raw,value=sha-${{ steps.commit.outputs.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.commit.outputs.sha }}
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+
+      - name: Log in to GHCR
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish AMD64 and ARM64 images
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Publish GitHub release
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" --json tagName > /dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --generate-notes --title "$RELEASE_TAG"
+          fi

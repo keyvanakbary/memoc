@@ -1,0 +1,4 @@
+/target/
+/_site/
+/_memoc-build/
+__pycache__/

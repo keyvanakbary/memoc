@@ -1,0 +1,14 @@
+[package]
+name = "memoc"
+version = "0.1.0"
+edition = "2024"
+description = "A small, opinionated static site builder for plain Markdown folders"
+
+[dependencies]
+anyhow = "1"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
