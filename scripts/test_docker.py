@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke-test a built image using a mounted folder and a published loopback port."""
+"""Smoke-test default-user builds, mounted content, and a published loopback port."""
 import argparse
 import os
 from pathlib import Path
@@ -31,6 +31,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", default="memoc:local")
     args = parser.parse_args()
+    image_user = docker("image", "inspect", args.image, "--format", "{{.Config.User}}")
+    assert image_user == "1000:1000", image_user
+    docker("run", "--rm", args.image, "build", "/docs")
     no_command = subprocess.run(["docker", "run", "--rm", args.image], capture_output=True, text=True)
     assert no_command.returncode != 0 and "usage:" in no_command.stderr, no_command
     with tempfile.TemporaryDirectory(prefix="memoc-docker-") as temporary:
@@ -88,7 +91,7 @@ def main():
 
             wait_for(deleted)
             assert (source / "_site/index.html").stat().st_uid == os.getuid()
-            print("Docker smoke test passed: explicit build and watch commands, /docs mount, published port, assets, HEAD, rebuilds, error recovery, and deletion.")
+            print("Docker smoke test passed: default non-root build, explicit build and watch commands, /docs mount, published port, assets, HEAD, rebuilds, error recovery, and deletion.")
         except Exception:
             subprocess.run(["docker", "logs", container], check=False)
             raise
