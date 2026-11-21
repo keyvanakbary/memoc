@@ -3,11 +3,20 @@
 A small, fast static site builder for plain Markdown. One folder in, a static website out. No configuration or front matter.
 
 ```sh
-memoc build ./docs
-memoc watch ./docs
+memoc build --serve ./docs
 ```
 
-`build` writes the site to `docs/_site/`. `watch` serves it at **http://127.0.0.1:4000** and rebuilds when files change. Refresh the browser to see updates. Both commands default to the current folder.
+This builds the site once into `docs/_site/` and serves its HTML, stylesheet, and assets at **http://127.0.0.1:4000**. Press Ctrl+C to stop the server.
+
+For a separate build and deployment, run `memoc build ./docs`, then `memoc serve ./docs/_site`. Only the generated directory and the Memoc binary are needed on the serving host. With no directory argument, `memoc serve` serves `./_site`.
+
+During editing, use `memoc watch ./docs` to rebuild when files change. Refresh the browser to see updates.
+
+The HTTP server is built into the Memoc binary using Rust’s standard library. To expose the site on all network interfaces, set the listening address and port when starting Memoc:
+
+```sh
+MEMOC_BIND=0.0.0.0:4000 memoc serve ./docs/_site
+```
 
 ## Binaries
 
@@ -39,6 +48,22 @@ docker run --rm --init --user "$(id -u):$(id -g)" \
 ```
 
 The generated site appears in `./docs/_site/`. The `--user` option keeps generated files owned by your user. Use `latest` for the newest release or a full version tag such as `0.1.1` to pin a release.
+
+### Package a prebuilt site
+
+With a Memoc image that includes `serve`, use two stages to package the generated files and the HTTP server together:
+
+```dockerfile
+FROM ghcr.io/keyvanakbary/memoc:latest AS build
+COPY . /docs/
+RUN ["/memoc", "build", "/docs"]
+
+FROM ghcr.io/keyvanakbary/memoc:latest
+COPY --from=build /docs/_site /site
+CMD ["serve", "/site"]
+```
+
+The runtime stage listens on port 4000. Publish it with `-p 80:4000` to serve the site on host port 80.
 
 ## Content
 

@@ -1,20 +1,43 @@
+use anyhow::{Context, Result};
 use std::{
     fs::File,
     io::{self, BufRead, BufReader, Read, Write},
-    net::TcpListener,
+    net::{SocketAddr, TcpListener},
     path::{Component, Path, PathBuf},
     sync::{Arc, RwLock},
     thread,
     time::Duration,
 };
 
-pub fn serve(listener: TcpListener, root: PathBuf, gate: Arc<RwLock<()>>) {
+pub fn run(root: &Path) -> Result<()> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("cannot open site directory {}", root.display()))?;
+    anyhow::ensure!(root.is_dir(), "{} is not a directory", root.display());
+    let listener = bind()?;
+    let address = listener.local_addr()?;
+    println!("Serving {} at http://{address}/", root.display());
+    serve(listener, root, Arc::new(RwLock::new(())))?;
+    Ok(())
+}
+
+pub fn bind() -> Result<TcpListener> {
+    let address = listen_address(std::env::var("MEMOC_BIND").ok().as_deref())?;
+    TcpListener::bind(address)
+        .with_context(|| format!("cannot serve at {address}; check that the port is available"))
+}
+
+fn listen_address(value: Option<&str>) -> Result<SocketAddr> {
+    value
+        .unwrap_or("127.0.0.1:4000")
+        .parse()
+        .context("MEMOC_BIND must be an IP address and port, for example 0.0.0.0:4000")
+}
+
+pub fn serve(listener: TcpListener, root: PathBuf, gate: Arc<RwLock<()>>) -> io::Result<()> {
     let root = Arc::new(root);
     for connection in listener.incoming() {
-        let Ok(mut stream) = connection else {
-            eprintln!("memoc: preview server could not accept a connection");
-            break;
-        };
+        let mut stream = connection?;
         let root = Arc::clone(&root);
         let gate = Arc::clone(&gate);
         thread::spawn(move || -> io::Result<()> {
@@ -24,6 +47,7 @@ pub fn serve(listener: TcpListener, root: PathBuf, gate: Arc<RwLock<()>>) {
             respond(&mut reader, &mut stream, &root, &gate)
         });
     }
+    Ok(())
 }
 
 // Read/write streams keep the HTTP handler testable without opening a socket.
@@ -216,6 +240,16 @@ mod tests {
     use super::*;
     use crate::test_support::Folder;
     use std::fs;
+
+    #[test]
+    fn local_runs_use_loopback_and_containers_can_bind_all_interfaces() {
+        assert_eq!(listen_address(None).unwrap().to_string(), "127.0.0.1:4000");
+        assert_eq!(
+            listen_address(Some("0.0.0.0:4000")).unwrap().to_string(),
+            "0.0.0.0:4000"
+        );
+        assert!(listen_address(Some("invalid")).is_err());
+    }
 
     fn request(root: &Path, request: &str) -> Vec<u8> {
         let mut response = Vec::new();

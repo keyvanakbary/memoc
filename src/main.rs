@@ -24,7 +24,7 @@ fn run() -> Result<()> {
     match args.as_slice() {
         [arg] if arg == "--help" => {
             println!(
-                "Usage: memoc build [folder]\n       memoc watch [folder]\n       memoc <folder>\n\nBuild plain Markdown into <folder>/_site/.\nREADME.md introduces a folder; its children are always listed.\nBoth commands default to the current folder.\n\n  build        Build once and exit\n  watch        Build, serve at http://127.0.0.1:4000, and rebuild on changes\n               Refresh the browser after edits.\n  --help       Show this help\n  --version    Show the version"
+                "Usage: memoc build [--serve] [folder]\n       memoc serve [site-directory]\n       memoc watch [folder]\n       memoc <folder>\n\nBuild plain Markdown into <folder>/_site/.\nREADME.md introduces a folder; its children are always listed.\nBuild and watch default to the current folder.\n\n  build        Build once, then exit or start the server with --serve\n  serve        Serve existing static files (default directory: ./_site)\n  watch        Build, serve at http://127.0.0.1:4000, and rebuild on changes\n               Refresh the browser after edits.\n  --help       Show this help\n  --version    Show the version"
             );
             Ok(())
         }
@@ -33,16 +33,37 @@ fn run() -> Result<()> {
             Ok(())
         }
         [command] if command == "build" => build(Path::new(".")),
+        [command, flag] if command == "build" && flag == "--serve" => {
+            build_and_serve(Path::new("."))
+        }
         [command, folder] if command == "build" && !folder.to_string_lossy().starts_with('-') => {
             build(Path::new(folder))
+        }
+        [command, flag, folder]
+            if command == "build"
+                && flag == "--serve"
+                && !folder.to_string_lossy().starts_with('-') =>
+        {
+            build_and_serve(Path::new(folder))
+        }
+        [command] if command == "serve" => server::run(Path::new("_site")),
+        [command, folder] if command == "serve" && !folder.to_string_lossy().starts_with('-') => {
+            server::run(Path::new(folder))
         }
         [command] if command == "watch" => watch::run(Path::new(".")),
         [command, folder] if command == "watch" && !folder.to_string_lossy().starts_with('-') => {
             watch::run(Path::new(folder))
         }
         [arg] if !arg.to_string_lossy().starts_with('-') => build(Path::new(arg)),
-        _ => bail!("usage: memoc build [folder] or memoc watch [folder] (see --help)"),
+        _ => bail!(
+            "usage: memoc build [--serve] [folder], memoc serve [site-directory], or memoc watch [folder] (see --help)"
+        ),
     }
+}
+
+fn build_and_serve(input: &Path) -> Result<()> {
+    build(input)?;
+    server::run(&input.join("_site"))
 }
 
 fn build(input: &Path) -> Result<()> {

@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use std::{
     collections::BTreeMap,
     fs,
-    net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
     thread,
@@ -19,14 +18,17 @@ pub fn run(input: &Path) -> Result<()> {
     anyhow::ensure!(input.is_dir(), "{} is not a folder", input.display());
     let output = input.join("_site");
     crate::check_output(&output)?;
-    let address = listen_address(std::env::var("MEMOC_BIND").ok().as_deref())?;
-    let listener = TcpListener::bind(address)
-        .with_context(|| format!("cannot serve at {address}; check that the port is available"))?;
+    let listener = crate::server::bind()?;
+    let address = listener.local_addr()?;
     let mut watcher = Watcher::new(&input)?;
     let gate = Arc::new(RwLock::new(()));
     rebuild(&input, &gate);
     let server_gate = Arc::clone(&gate);
-    thread::spawn(move || crate::server::serve(listener, output, server_gate));
+    thread::spawn(move || {
+        if let Err(error) = crate::server::serve(listener, output, server_gate) {
+            eprintln!("memoc: HTTP server stopped: {error}");
+        }
+    });
     println!(
         "Watching {}\nhttp://{address}/\nRefresh the browser after edits. Press Ctrl+C to stop.",
         input.display()
@@ -50,13 +52,6 @@ pub fn run(input: &Path) -> Result<()> {
             }
         }
     }
-}
-
-fn listen_address(value: Option<&str>) -> Result<SocketAddr> {
-    value
-        .unwrap_or("127.0.0.1:4000")
-        .parse()
-        .context("MEMOC_BIND must be an IP address and port, for example 0.0.0.0:4000")
 }
 
 fn rebuild(input: &Path, gate: &RwLock<()>) {
@@ -128,16 +123,6 @@ fn snapshot(input: &Path) -> Result<Snapshot> {
 mod tests {
     use super::*;
     use crate::test_support::Folder;
-
-    #[test]
-    fn local_runs_use_loopback_and_containers_can_bind_all_interfaces() {
-        assert_eq!(listen_address(None).unwrap().to_string(), "127.0.0.1:4000");
-        assert_eq!(
-            listen_address(Some("0.0.0.0:4000")).unwrap().to_string(),
-            "0.0.0.0:4000"
-        );
-        assert!(listen_address(Some("invalid")).is_err());
-    }
 
     #[test]
     fn coalesces_changes_and_detects_create_edit_rename_delete_and_assets() {
