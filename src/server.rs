@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::{
+    collections::HashMap,
     fs::File,
     io::{self, BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener},
@@ -38,6 +39,12 @@ pub fn serve(listener: TcpListener, root: PathBuf, gate: Arc<RwLock<()>>) -> io:
     let root = Arc::new(root);
     for connection in listener.incoming() {
         let mut stream = connection?;
+        // Each active connection holds one reference. Only this accept loop adds them.
+        if Arc::strong_count(&root) > 32 {
+            stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+            let _ = status(&mut stream, "503 Service Unavailable", false, "");
+            continue;
+        }
         let root = Arc::clone(&root);
         let gate = Arc::clone(&gate);
         thread::spawn(move || -> io::Result<()> {
@@ -92,6 +99,9 @@ fn respond(
     {
         return status(output, "400 Bad Request", head, "");
     }
+    if target.split('?').next() == Some("/mcp") {
+        return mcp_response(input, output, method, header, root, gate);
+    }
     if !matches!(*method, "GET" | "HEAD") {
         return status(
             output,
@@ -142,6 +152,14 @@ fn respond(
         }
         path = index;
     }
+    if path
+        .strip_prefix(&root)
+        .unwrap()
+        .components()
+        .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+    {
+        return status(output, "404 Not Found", head, "");
+    }
     let Ok(mut file) = File::open(&path) else {
         return status(output, "404 Not Found", head, "");
     };
@@ -154,6 +172,147 @@ fn respond(
         io::copy(&mut file, output)?;
     }
     Ok(())
+}
+
+fn mcp_response(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    method: &str,
+    header: &str,
+    root: &Path,
+    gate: &RwLock<()>,
+) -> io::Result<()> {
+    let mut fields = HashMap::new();
+    for line in header.lines().skip(1).filter(|s| !s.is_empty()) {
+        let Some((name, value)) = line.split_once(':') else {
+            return status(output, "400 Bad Request", false, "");
+        };
+        if fields
+            .insert(name.to_ascii_lowercase(), value.trim())
+            .is_some()
+        {
+            return status(output, "400 Bad Request", false, "");
+        }
+    }
+    if let Some(origin) = fields.get("origin") {
+        let allowed = std::env::var("MEMOC_ORIGIN").ok();
+        // Native clients omit Origin. Browsers must use the configured origin or loopback.
+        let local = origin
+            .strip_prefix("http://")
+            .or_else(|| origin.strip_prefix("https://"))
+            .is_some_and(|authority| {
+                fields.get("host") == Some(&authority)
+                    && ["localhost", "127.0.0.1", "[::1]"].iter().any(|host| {
+                        authority == *host
+                            || authority
+                                .strip_prefix(host)
+                                .and_then(|s| s.strip_prefix(':'))
+                                .is_some_and(|port| port.parse::<u16>().is_ok())
+                    })
+            });
+        if !local && allowed.as_deref() != Some(*origin) {
+            return status(output, "403 Forbidden", method == "HEAD", "");
+        }
+    }
+    if method != "POST" {
+        return status(
+            output,
+            "405 Method Not Allowed",
+            method == "HEAD",
+            "Allow: POST\r\n",
+        );
+    }
+    if !fields.get("content-type").is_some_and(|v| {
+        v.split(';')
+            .next()
+            .unwrap()
+            .trim()
+            .eq_ignore_ascii_case("application/json")
+    }) {
+        return status(output, "415 Unsupported Media Type", false, "");
+    }
+    let bytes = match read_body(input, &fields) {
+        Ok(bytes) => bytes,
+        Err(code) => return status(output, code, false, ""),
+    };
+    let reply = {
+        let _guard = gate.read().unwrap();
+        crate::mcp::dispatch(root, &fields, &bytes)
+    };
+    let body = reply.body.map(|v| v.to_string()).unwrap_or_default();
+    headers(
+        output,
+        reply.status,
+        "application/json",
+        body.len() as u64,
+        "",
+    )?;
+    output.write_all(body.as_bytes())
+}
+
+fn read_body(
+    input: &mut impl BufRead,
+    fields: &HashMap<String, &str>,
+) -> Result<Vec<u8>, &'static str> {
+    const MAX_BODY: usize = 64 * 1024;
+    const BAD: &str = "400 Bad Request";
+    const LARGE: &str = "413 Content Too Large";
+    let mut body = Vec::new();
+    if let Some(encoding) = fields.get("transfer-encoding") {
+        if fields.contains_key("content-length") || !encoding.eq_ignore_ascii_case("chunked") {
+            return Err(BAD);
+        }
+        // Bound chunk framing as well as decoded data, even for empty or very small chunks.
+        let mut bounded = input.take((2 * MAX_BODY) as u64);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            bounded.read_line(&mut line).map_err(|_| BAD)?;
+            let line = line.strip_suffix("\r\n").ok_or(BAD)?;
+            let digits = line.split(';').next().unwrap();
+            if !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(BAD);
+            }
+            let count = usize::from_str_radix(digits, 16).map_err(|_| BAD)?;
+            if count == 0 {
+                break;
+            }
+            if count > MAX_BODY - body.len() {
+                return Err(LARGE);
+            }
+            let start = body.len();
+            body.resize(start + count, 0);
+            bounded.read_exact(&mut body[start..]).map_err(|_| BAD)?;
+            let mut end = [0; 2];
+            bounded.read_exact(&mut end).map_err(|_| BAD)?;
+            if end != *b"\r\n" {
+                return Err(BAD);
+            }
+        }
+        // Trailers carry no MCP metadata; consume them to finish the message.
+        loop {
+            line.clear();
+            bounded.read_line(&mut line).map_err(|_| BAD)?;
+            if line == "\r\n" {
+                break;
+            }
+            if !line.ends_with("\r\n") || !line.contains(':') {
+                return Err(BAD);
+            }
+        }
+    } else {
+        let length = fields.get("content-length").ok_or("411 Length Required")?;
+        if !length.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(BAD);
+        }
+        let length = length.parse::<usize>().map_err(|_| BAD)?;
+        if length > MAX_BODY {
+            return Err(LARGE);
+        }
+        body.resize(length, 0);
+        input.read_exact(&mut body).map_err(|_| BAD)?;
+    }
+    Ok(body)
 }
 
 fn headers(
@@ -368,6 +527,109 @@ mod tests {
                 &format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(8192))
             )
             .starts_with(b"HTTP/1.1 431")
+        );
+    }
+
+    #[test]
+    fn stateless_mcp_discovery_search_and_fetch() {
+        use serde_json::{Value, json};
+        let input = Folder::new();
+        input.write("mcp.md", "# Help\n\nAn orange dial");
+        crate::build(&input.0).unwrap();
+        let root = input.0.join("_site");
+        let rpc = |body: Value, headers: &str| {
+            let raw = body.to_string();
+            let message = format!(
+                "POST /mcp HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{headers}\r\n{raw}",
+                raw.len()
+            );
+            let response = String::from_utf8(request(&root, &message)).unwrap();
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            (
+                headers.to_owned(),
+                serde_json::from_str::<Value>(body).unwrap_or(Value::Null),
+            )
+        };
+        let legacy = "MCP-Protocol-Version: 2025-11-25\r\n";
+        let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}});
+        assert_eq!(
+            rpc(init, "").1["result"]["protocolVersion"],
+            crate::mcp::LEGACY
+        );
+        assert!(
+            rpc(
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                legacy
+            )
+            .0
+            .starts_with("HTTP/1.1 202")
+        );
+        let discover = json!({"jsonrpc":"2.0","id":2,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}});
+        let modern = "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: server/discover\r\n";
+        assert_eq!(
+            rpc(discover.clone(), modern).1["result"]["supportedVersions"][0],
+            crate::mcp::CURRENT
+        );
+        assert_eq!(rpc(discover, legacy).1["error"]["code"], -32020);
+        let call = |name: &str, args| json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":name,"arguments":args}});
+        let search = call("search", json!({"query":"orange"}));
+        let (_, result) = rpc(search.clone(), legacy);
+        let hit = &result["result"]["structuredContent"]["passages"][0];
+        assert_eq!(hit["url"], "/mcp/#help");
+        let (_, result) = rpc(call("fetch", json!({"id":hit["id"]})), legacy);
+        assert_eq!(
+            result["result"]["structuredContent"]["passages"][0]["text"],
+            "An orange dial"
+        );
+        assert!(
+            rpc(search.clone(), "Origin: https://other.example\r\n")
+                .0
+                .starts_with("HTTP/1.1 403")
+        );
+        assert_eq!(
+            rpc(call("search", json!({"query":"a","limit":21})), legacy).1["result"]["isError"],
+            true
+        );
+        assert!(request(&root, "GET /mcp/ HTTP/1.1\r\n\r\n").starts_with(b"HTTP/1.1 200"));
+        assert!(request(&root, "GET /mcp HTTP/1.1\r\n\r\n").starts_with(b"HTTP/1.1 405"));
+        assert!(
+            request(&root, "GET /.memoc-search.sqlite3 HTTP/1.1\r\n\r\n")
+                .starts_with(b"HTTP/1.1 404")
+        );
+        fs::remove_file(root.join(".memoc-search.sqlite3")).unwrap();
+        assert!(
+            rpc(search, legacy).1["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("memoc build")
+        );
+        assert!(request(&root, "GET / HTTP/1.1\r\n\r\n").starts_with(b"HTTP/1.1 200"));
+    }
+
+    #[test]
+    fn mcp_body_framing_and_limits() {
+        let root = Folder::new();
+        let message = |fields: &str, body: &str| {
+            request(
+                &root.0,
+                &format!(
+                    "POST /mcp HTTP/1.1\r\nContent-Type: application/json\r\n{fields}\r\n{body}"
+                ),
+            )
+        };
+        let rpc = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let chunks = format!("{:x}\r\n{rpc}\r\n0\r\n\r\n", rpc.len());
+        assert!(message("Transfer-Encoding: chunked\r\n", &chunks).starts_with(b"HTTP/1.1 200"));
+        assert!(
+            message(
+                "Transfer-Encoding: chunked\r\nContent-Length: 1\r\n",
+                &chunks
+            )
+            .starts_with(b"HTTP/1.1 400")
+        );
+        assert!(message("Content-Length: 65537\r\n", "").starts_with(b"HTTP/1.1 413"));
+        assert!(
+            message("Transfer-Encoding: chunked\r\n", "10001\r\n").starts_with(b"HTTP/1.1 413")
         );
     }
 

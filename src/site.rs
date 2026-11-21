@@ -45,6 +45,7 @@ impl Site {
             outputs.insert(format!("{}index.html", node.route), source.to_owned());
         }
         for asset in &site.assets {
+            anyhow::ensure!(asset != "mcp", "asset mcp collides with the /mcp endpoint");
             if let Some(previous) = outputs.insert(asset.clone(), asset.clone()) {
                 bail!("output collision: {previous:?} and {asset:?}");
             }
@@ -223,4 +224,12 @@ pub fn relative_url(from: &str, to: &str) -> String {
     }
     // Prevent a filename containing ':' from being mistaken for a URL scheme (encoded above).
     result
+}
+
+pub fn public_url(route: &str) -> String {
+    if route.is_empty() {
+        "/".to_owned()
+    } else {
+        format!("/{}", relative_url("", route))
+    }
 }

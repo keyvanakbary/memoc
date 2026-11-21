@@ -1,5 +1,7 @@
 mod markdown;
+mod mcp;
 mod render;
+mod search;
 mod server;
 mod site;
 mod watch;
@@ -8,7 +10,7 @@ mod watch;
 mod test_support;
 
 use anyhow::{Context, Result, bail};
-use std::{env, fs, path::Path, time::Instant};
+use std::{env, fs, path::Path, sync::RwLock, time::Instant};
 
 const MARKER: &str = "memoc output v1\n";
 
@@ -67,6 +69,10 @@ fn build_and_serve(input: &Path) -> Result<()> {
 }
 
 fn build(input: &Path) -> Result<()> {
+    build_site(input, None)
+}
+
+fn build_site(input: &Path, gate: Option<&RwLock<()>>) -> Result<()> {
     let started = Instant::now();
     let input = input
         .canonicalize()
@@ -85,13 +91,28 @@ fn build(input: &Path) -> Result<()> {
     let generated = staging.join("site");
     fs::create_dir(&generated)?;
     fs::write(generated.join("_memoc.css"), include_str!("style.css"))?;
+    let index = search::create(&generated)?;
+    let folders: std::collections::HashMap<_, _> = site
+        .nodes
+        .iter()
+        .filter(|node| node.folder)
+        .map(|node| (node.route.trim_end_matches('/'), node.title.as_str()))
+        .collect();
     for node in &site.nodes {
         let body = match &node.source {
             Some(source) => {
                 let text = fs::read_to_string(input.join(source))
                     .with_context(|| format!("cannot read {source}"))?;
-                markdown::render(&text, source, &node.route, &site)
-                    .with_context(|| format!("in {source}"))?
+                let (html, sections) = markdown::render(&text, source, &node.route, &site)
+                    .with_context(|| format!("in {source}"))?;
+                search::Document {
+                    source,
+                    title: &node.title,
+                    folder: node.parent.map_or("", |id| &site.nodes[id].title),
+                    url: site::public_url(&node.route),
+                }
+                .index(&index, sections.into_iter().map(|s| (s, None)))?;
+                html
             }
             None => String::new(),
         };
@@ -107,11 +128,27 @@ fn build(input: &Path) -> Result<()> {
     for asset in &site.assets {
         let destination = generated.join(asset);
         fs::create_dir_all(destination.parent().unwrap())?;
-        bytes += fs::copy(input.join(asset), destination)
+        bytes += fs::copy(input.join(asset), &destination)
             .with_context(|| format!("cannot copy {asset}"))?;
+        if destination
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+        {
+            let (folder, name) = asset.rsplit_once('/').unwrap_or(("", asset));
+            search::Document {
+                source: asset,
+                title: name,
+                folder: folders[folder],
+                url: site::public_url(asset),
+            }
+            .index_pdf(&index, &destination)?;
+        }
     }
+    search::finish(index)?;
     let copy_elapsed = copy_started.elapsed();
     fs::write(generated.join(".memoc"), MARKER)?;
+    // Watch serves the previous generation while the next one is being indexed.
+    let _guard = gate.map(|lock| lock.write().unwrap());
     check_output(&output)?;
     let backup = staging.join("previous");
     let had_output = output.exists();
@@ -127,7 +164,7 @@ fn build(input: &Path) -> Result<()> {
     }
     cleanup.published = true;
     println!(
-        "Built {} pages and {} assets ({} bytes) in {:.3}s: render {:.3}s, copy {:.3}s\n{}",
+        "Built {} pages and {} assets ({} bytes) in {:.3}s: pages {:.3}s, assets and index {:.3}s\n{}",
         site.nodes.len(),
         site.assets.len(),
         bytes,

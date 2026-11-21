@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Smoke-test default-user builds, mounted content, and a published loopback port."""
 import argparse
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -27,6 +28,18 @@ def wait_for(check):
     raise AssertionError(f"Container did not reach the expected state: {last_error}")
 
 
+def call_tool(base, name, arguments):
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": arguments}}
+    request = Request(base + "/mcp", data=json.dumps(body).encode(), headers={
+        "Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": "2025-11-25",
+    })
+    with urlopen(request, timeout=3) as response:
+        result = json.load(response)["result"]
+        assert not result.get("isError"), result
+        return result["structuredContent"]["passages"]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", default="memoc:local")
@@ -41,7 +54,7 @@ def main():
         (source / "README.md").write_text("# Docker preview\n\nMounted content.")
         (source / "manuals").mkdir()
         (source / "manuals/oven.md").write_text("# Oven\n\n[Manual](manual.pdf)")
-        pdf = b"%PDF-1.4\nbyte-identical attachment\n"
+        pdf = (Path(__file__).resolve().parents[1] / "tests/fixtures/manual.pdf").read_bytes()
         (source / "manuals/manual.pdf").write_bytes(pdf)
         docker(
             "run", "--rm", "--init", "--user", f"{os.getuid()}:{os.getgid()}",
@@ -49,6 +62,20 @@ def main():
         )
         assert "Mounted content." in (source / "_site/index.html").read_text()
         assert (source / "_site/manuals/manual.pdf").read_bytes() == pdf
+        static = docker(
+            "run", "--detach", "--read-only", "--publish", "127.0.0.1::4000",
+            "--volume", f"{source / '_site'}:/site:ro", args.image, "serve", "/site",
+        )
+        try:
+            base = "http://" + docker("port", static, "4000/tcp").splitlines()[0]
+            wait_for(lambda: call_tool(base, "search", {"query": "interlock"}))
+            hit = call_tool(base, "search", {"query": "interlock"})[0]
+            assert hit["url"] == "/manuals/manual.pdf#page=1"
+            passages = call_tool(base, "fetch", {"id": hit["id"]})
+            assert [p["page"] for p in passages] == [1, 3]
+        finally:
+            subprocess.run(["docker", "rm", "--force", static], check=False, stdout=subprocess.DEVNULL)
+
         container = docker(
             "run", "--detach", "--init", "--user", f"{os.getuid()}:{os.getgid()}",
             "--publish", "127.0.0.1::4000", "--volume", f"{source}:/docs", args.image, "watch", "/docs",
@@ -71,10 +98,12 @@ def main():
 
             (source / "README.md").write_text("# Updated preview\n\nSaved change.")
             wait_for(lambda: b"Saved change." in get())
+            assert call_tool(base, "search", {"query": "Saved"})
             previous = get()
             (source / "README.md").write_text("# Invalid edit\n[Missing](missing.md)")
             wait_for(lambda: "Build failed" in docker("logs", container))
             assert get() == previous
+            assert call_tool(base, "search", {"query": "Saved"})
             (source / "README.md").write_text("# Recovered preview")
             wait_for(lambda: b"Recovered preview" in get())
 
@@ -90,8 +119,9 @@ def main():
                 return False
 
             wait_for(deleted)
+            assert not call_tool(base, "search", {"query": "Added"})
             assert (source / "_site/index.html").stat().st_uid == os.getuid()
-            print("Docker smoke test passed: default non-root build, explicit build and watch commands, /docs mount, published port, assets, HEAD, rebuilds, error recovery, and deletion.")
+            print("Docker smoke test passed: non-root build, read-only MCP search and fetch, static files, and watch rebuilds including failed edits and deletion.")
         except Exception:
             subprocess.run(["docker", "logs", container], check=False)
             raise

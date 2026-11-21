@@ -55,9 +55,7 @@ pub fn run(input: &Path) -> Result<()> {
 }
 
 fn rebuild(input: &Path, gate: &RwLock<()>) {
-    // Requests cannot observe the short gap while the output directory is replaced.
-    let _guard = gate.write().unwrap();
-    if let Err(error) = crate::build(input) {
+    if let Err(error) = crate::build_site(input, Some(gate)) {
         eprintln!(
             "memoc: {error:#}\nBuild failed; keeping the previous site and watching for changes."
         );

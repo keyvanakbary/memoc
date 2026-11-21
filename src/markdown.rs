@@ -1,3 +1,4 @@
+use crate::search::Section;
 use crate::site::{Site, relative_url};
 use anyhow::{Result, bail};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd, html};
@@ -25,7 +26,12 @@ pub fn title(text: &str) -> Option<String> {
     None
 }
 
-pub fn render(text: &str, source: &str, route: &str, site: &Site) -> Result<String> {
+pub fn render(
+    text: &str,
+    source: &str,
+    route: &str,
+    site: &Site,
+) -> Result<(String, Vec<Section>)> {
     let mut events: Vec<_> = Parser::new_ext(text, options()).collect();
     let mut ids = HashSet::from(["main".to_owned()]);
     for index in 0..events.len() {
@@ -57,8 +63,45 @@ pub fn render(text: &str, source: &str, route: &str, site: &Site) -> Result<Stri
         }
     }
     let mut output = String::with_capacity(text.len() * 2);
+    let sections = sections(&events);
     html::push_html(&mut output, events.into_iter());
-    Ok(output)
+    Ok((output, sections))
+}
+
+fn sections(events: &[Event]) -> Vec<Section> {
+    let mut sections = vec![Section::default()];
+    let mut in_heading = false;
+    for event in events {
+        let section = sections.last_mut().unwrap();
+        match event {
+            Event::Start(Tag::Heading {
+                id: Some(anchor), ..
+            }) => {
+                sections.push(Section {
+                    anchor: anchor.to_string(),
+                    ..Section::default()
+                });
+                in_heading = true;
+            }
+            Event::End(TagEnd::Heading(_)) => in_heading = false,
+            Event::Text(value) | Event::Code(value) => {
+                if in_heading {
+                    section.heading.push_str(value);
+                } else {
+                    section.text.push_str(value);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak if in_heading => section.heading.push(' '),
+            Event::SoftBreak | Event::HardBreak | Event::End(TagEnd::TableCell) => {
+                section.text.push(' ')
+            }
+            Event::End(TagEnd::Paragraph | TagEnd::Item | TagEnd::CodeBlock | TagEnd::TableRow) => {
+                section.text.push_str("\n\n")
+            }
+            _ => (),
+        }
+    }
+    sections
 }
 
 fn slug(text: &str) -> String {
