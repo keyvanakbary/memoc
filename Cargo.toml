@@ -1,6 +1,6 @@
 [package]
 name = "memoc"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "A small, opinionated static site builder for plain Markdown folders"
 
