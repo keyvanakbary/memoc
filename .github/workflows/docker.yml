@@ -9,123 +9,234 @@ on:
 permissions:
   contents: read
 
-# Serialize releases. A queued run checks out the latest main and includes all
-# commits since the previous release; a release already in progress is not cancelled.
+# Plan once from the latest main, even when a release was queued.
 concurrency:
   group: docker-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  image:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      packages: write
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      base: ${{ steps.source.outputs.base }}
+      revision: ${{ steps.source.outputs.revision }}
+      version: ${{ steps.source.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      changed: ${{ steps.release.outputs.changed }}
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.ref == 'refs/heads/main' && 'main' || github.ref }}
           fetch-depth: 0
-          persist-credentials: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+          persist-credentials: false
 
       - name: Test release rules
         run: python3 -m unittest discover -s scripts -p 'test_release.py'
 
-      # Highest bump wins: breaking change = major, feat = minor, anything else = patch.
       - name: Prepare release version
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         id: release
         run: python3 scripts/release.py
 
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
-
-      - name: Build image for testing
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          load: true
-          tags: memoc:test
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Test mounted content, HTTP serving, and rebuilds
-        run: python3 scripts/test_docker.py --image memoc:test
-
-      - name: Commit and tag the tested version
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-        id: commit
+      - name: Freeze the source and image revision for all native jobs
+        id: source
         env:
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
           VERSION_CHANGED: ${{ steps.release.outputs.changed }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
-          if [ "$VERSION_CHANGED" = true ]; then
+          base=$(git rev-parse HEAD)
+          mkdir -p "$RUNNER_TEMP/prepared"
+          if [[ "$VERSION_CHANGED" == true ]]; then
+            git switch -c release-candidate
             git add Cargo.toml Cargo.lock
             git -c user.name='github-actions[bot]' \
-                -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-                commit -m "chore(release): $RELEASE_TAG [skip ci]"
-            git tag "$RELEASE_TAG"
-            git push --atomic origin HEAD:refs/heads/main "refs/tags/$RELEASE_TAG"
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "chore(release): $RELEASE_TAG [skip ci]"
+            git bundle create "$RUNNER_TEMP/prepared/release.bundle" refs/heads/release-candidate "^$base"
           fi
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git archive -o "$RUNNER_TEMP/prepared/source.tar" HEAD
+          {
+            echo "base=$base"
+            echo "revision=$(git rev-parse HEAD)"
+            python3 -c 'import tomllib; print("version=" + tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])'
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Image tags and labels
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prepared-source
+          path: ${{ runner.temp }}/prepared
+          overwrite: true
+          if-no-files-found: error
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(needs.prepare.outputs.tag && '["amd64","arm64"]' || '["amd64"]') }}
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    env:
+      ARCH: ${{ matrix.arch }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      REVISION: ${{ needs.prepare.outputs.revision }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: prepared-source
+          path: ${{ runner.temp }}/prepared
+
+      - name: Restore source and identify native compiler
+        id: builder
+        run: |
+          tar xf "$RUNNER_TEMP/prepared/source.tar"
+          docker pull rust:1-alpine
+          builder=$(docker image inspect rust:1-alpine --format '{{.Id}}')
+          echo "image=$builder" >> "$GITHUB_OUTPUT"
+          echo "key=cargo-v1-$ARCH-${builder#sha256:}-$(python3 scripts/ci-cache-key.py)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiled dependencies
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/cargo-cache
+          key: ${{ steps.builder.outputs.key }}
+
+      - name: Run Rust tests and compile native release binary
+        env:
+          BUILDER: ${{ steps.builder.outputs.image }}
+        run: |
+          mkdir -p "$RUNNER_TEMP"/{cargo-cache,runtime}
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$PWD:/build:ro" -v "$RUNNER_TEMP/cargo-cache:/cache" \
+            -v "$RUNNER_TEMP/runtime:/out" -w /build "$BUILDER" sh scripts/ci-build.sh
+
+      - name: Save compiled dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/cargo-cache
+          key: ${{ steps.builder.outputs.key }}
+
+      - name: Build and smoke-test the native image
+        run: |
+          docker build --target prebuilt -f Dockerfile -t memoc:test \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$REVISION" \
+            --label "org.opencontainers.image.version=$RELEASE_VERSION" "$RUNNER_TEMP/runtime"
+          test "$(docker image inspect memoc:test --format '{{.Architecture}}')" = "$ARCH"
+          python3 scripts/test_docker.py --image memoc:test
+
+      - name: Export tested image and its exact binary
+        if: needs.prepare.outputs.tag != ''
+        run: |
+          out="$RUNNER_TEMP/export"
+          mkdir -p "$out"
+          container=$(docker create memoc:test)
+          trap 'docker rm "$container" >/dev/null' EXIT
+          docker cp "$container:/memoc" "$RUNNER_TEMP/memoc"
+          cmp "$RUNNER_TEMP/runtime/memoc" "$RUNNER_TEMP/memoc"
+          test "$("$RUNNER_TEMP/memoc" --version)" = "memoc $RELEASE_VERSION"
+          tar czf "$out/memoc-linux-$ARCH.tar.gz" -C "$RUNNER_TEMP" memoc
+          docker save memoc:test -o "$out/image.tar"
+
+      - uses: actions/upload-artifact@v4
+        if: needs.prepare.outputs.tag != ''
+        with:
+          name: native-${{ matrix.arch }}
+          path: ${{ runner.temp }}/export
+          overwrite: true
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      REVISION: ${{ needs.prepare.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.base }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        if: needs.prepare.outputs.changed == 'true'
+        with:
+          name: prepared-source
+          path: ${{ runner.temp }}/prepared
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: ${{ runner.temp }}/native
+
+      - name: Push the tested commit and tag
+        if: needs.prepare.outputs.changed == 'true'
+        run: |
+          git fetch "$RUNNER_TEMP/prepared/release.bundle" refs/heads/release-candidate
+          test "$(git rev-parse FETCH_HEAD)" = "$REVISION"
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            # The publish job may be retrying after its atomic push succeeded.
+            test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$REVISION"
+          else
+            git tag "$RELEASE_TAG" "$REVISION"
+            git push --atomic origin "$REVISION:refs/heads/main" "refs/tags/$RELEASE_TAG"
+          fi
+
+      - name: Check that this release still owns the latest version
+        run: |
+          newest=$(git tag --list --sort=-v:refname | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/ && !found { print; found=1 }')
+          test "$newest" = "$RELEASE_TAG"
+
+      - name: Image tags
         id: meta
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
           flavor: latest=true
           tags: |
-            type=semver,pattern={{version}},value=${{ steps.release.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.release.outputs.version }}
-            type=semver,pattern={{major}},value=${{ steps.release.outputs.version }},enable=${{ !startsWith(steps.release.outputs.version, '0.') }}
-            type=raw,value=sha-${{ steps.commit.outputs.sha }}
-          labels: |
-            org.opencontainers.image.revision=${{ steps.commit.outputs.sha }}
-            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+            type=semver,pattern={{version}},value=${{ env.RELEASE_VERSION }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.RELEASE_VERSION }}
+            type=semver,pattern={{major}},value=${{ env.RELEASE_VERSION }},enable=${{ !startsWith(env.RELEASE_VERSION, '0.') }}
+            type=raw,value=sha-${{ env.REVISION }}
 
-      - name: Log in to GHCR
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-        uses: docker/login-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish images and export AMD64 and ARM64 binaries
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          outputs: type=local,dest=binaries
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Package release binaries
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+      - name: Publish the two tested images by digest and tag their manifest
         env:
-          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          sources=()
           mkdir -p release
           for arch in amd64 arm64; do
-            binary="binaries/linux_$arch/memoc"
-            test -x "$binary"
-            test "$("$binary" --version)" = "memoc $RELEASE_VERSION"
-            tar -czf "release/memoc-linux-$arch.tar.gz" -C "binaries/linux_$arch" memoc
+            native="$RUNNER_TEMP/native/native-$arch"
+            dir="$RUNNER_TEMP/image-$arch"
+            skopeo --override-arch "$arch" copy --format oci --dest-compress \
+              "docker-archive:$native/image.tar" "dir:$dir"
+            digest=$(skopeo manifest-digest "$dir/manifest.json")
+            skopeo copy --preserve-digests "dir:$dir" "docker://$image@$digest"
+            sources+=("$image@$digest")
+            cp "$native/memoc-linux-$arch.tar.gz" release/
           done
+          tags=()
+          while IFS= read -r tag; do tags+=(--tag "$tag"); done <<< "$IMAGE_TAGS"
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
           cd release
           sha256sum memoc-*.tar.gz > SHA256SUMS
 
       - name: Publish GitHub release
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           if ! gh release view "$RELEASE_TAG" --json tagName > /dev/null 2>&1; then
             gh release create "$RELEASE_TAG" --verify-tag --generate-notes --title "$RELEASE_TAG" --draft
